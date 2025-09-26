@@ -18,9 +18,6 @@ SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 FOLDER_ID = os.getenv("FOLDER_ID")  # ID folderu Google Drive
 DOWNLOADS = os.getenv("DOWNLOADS_DIR")
 DB_PATH = os.getenv("DB_PATH")
-# Opcjonalnie: ID współdzielonego dysku (Shared Drive). Jeśli ustawione, zapytania będą
-# kierowane bezpośrednio do tego dysku. W przeciwnym razie przeszukamy wszystkie dyski.
-SHARED_DRIVE_ID = os.getenv("SHARED_DRIVE_ID")
 print(FOLDER_ID, DOWNLOADS, DB_PATH)
 
 # ============================
@@ -55,8 +52,9 @@ def is_new_file(path):
 # --- Autoryzacja Google Drive ---
 def get_service():
     creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    token_path = os.path.abspath('token.json')
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -65,6 +63,12 @@ def get_service():
             creds = flow.run_local_server(port=0)
         with open('token.json', 'w') as token:
             token.write(creds.to_json())
+    print(f"Using token: {token_path}")
+    try:
+        userinfo = build('oauth2', 'v2', credentials=creds).userinfo().get().execute()
+        print(f"Drive account: {userinfo.get('email')}")
+    except Exception:
+        pass
     return build('drive', 'v3', credentials=creds)
 
 # --- Pobieranie mp3 z Google Drive ---
@@ -72,26 +76,28 @@ def download_new_mp3(folder_id, download_path=DOWNLOADS):
     service = get_service()
     os.makedirs(download_path, exist_ok=True)
 
-    # Wsparcie dla Shared Drives: włączamy all-drives i opcjonalnie kierujemy zapytanie
-    # do konkretnego dysku współdzielonego, jeśli SHARED_DRIVE_ID jest ustawione.
-    list_params = {
-        "q": f"'{folder_id}' in parents and mimeType='audio/mpeg' and trashed=false",
-        "fields": "files(id, name)",
-        "supportsAllDrives": True,
-        "includeItemsFromAllDrives": True,
-        "pageSize": 1000,
-    }
-    if SHARED_DRIVE_ID:
-        list_params["corpora"] = "drive"
-        list_params["driveId"] = SHARED_DRIVE_ID
-    else:
-        list_params["corpora"] = "allDrives"
+    try:
+        folder_meta = service.files().get(
+            fileId=folder_id,
+            fields="id, name, mimeType, parents").execute()
+        print(f"Folder meta: {folder_meta}")
+    except Exception as e:
+        print(f"Cannot read folder meta ({folder_id}): {e}")
 
-    results = service.files().list(**list_params).execute()
+    # List all direct children first, then filter locally to catch odd MIME types
+    results = service.files().list(
+        q=f"'{folder_id}' in parents and trashed=false",
+        fields="files(id, name, mimeType)").execute()
     items = results.get('files', [])
+    print(f"Children: {[{'name': i['name'], 'mimeType': i.get('mimeType')} for i in items]}")
 
     new_files = []
     for file in items:
+        name_lower = file['name'].lower()
+        mime = file.get('mimeType') or ""
+        allowed_exts = ('.mp3', '.m4a', '.wav')
+        if not (mime.startswith('audio/') or name_lower.endswith(allowed_exts)):
+            continue
         file_path = os.path.join(download_path, file['name'])
         if not os.path.exists(file_path):
             print(f"⬇️ Pobieram {file['name']}...")
@@ -124,7 +130,8 @@ def transcribe_with_elevenlabs(file_path):
     )
     text = transcription["text"] if isinstance(transcription, dict) else transcription.text
 
-    txt_path = file_path.replace(".mp3", ".txt")
+    base, _ = os.path.splitext(file_path)
+    txt_path = base + ".txt"
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(text)
     print(f"✔ Zapisano transkrypt: {txt_path}")
@@ -132,7 +139,6 @@ def transcribe_with_elevenlabs(file_path):
 # --- Main ---
 if __name__ == "__main__":
     files = download_new_mp3(FOLDER_ID)
-    print(files)
     exit()
     for f in files:
         if is_new_file(f):
