@@ -2,6 +2,7 @@ import os
 import io
 import hashlib
 import sqlite3
+import re
 from elevenlabs.client import ElevenLabs
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
@@ -78,6 +79,10 @@ def format_timestamp(total_seconds):
     if hours:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+def normalize_transcript_text(text):
+    # Collapse runs of spaces/tabs to single spaces per line and trim
+    return "\n".join(re.sub(r"[\t ]+", " ", line).strip() for line in text.split("\n"))
 
 def build_diarized_lines_from_words(words):
     lines = []
@@ -273,6 +278,9 @@ def transcribe_with_elevenlabs(file_path):
         else:
             text = getattr(transcription, "text", "")
 
+    # Normalize whitespace in final text
+    text = normalize_transcript_text(text)
+
     # Zapis do pliku DOCX
     base, _ = os.path.splitext(file_path)
     docx_path = base + ".docx"
@@ -281,8 +289,18 @@ def transcribe_with_elevenlabs(file_path):
         from docx.shared import Pt
         doc = Document()
         style = doc.styles["Normal"]
-        style.font.name = "Calibri"
+        style.font.name = "Arial"
         style.font.size = Pt(11)
+        # Ustaw font dla wszystkich skryptów, aby poprawnie wyświetlać polskie znaki
+        try:
+            from docx.oxml.ns import qn
+            rFonts = style.element.rPr.rFonts
+            rFonts.set(qn('w:ascii'), 'Arial')
+            rFonts.set(qn('w:hAnsi'), 'Arial')
+            rFonts.set(qn('w:eastAsia'), 'Arial')
+            rFonts.set(qn('w:cs'), 'Arial')
+        except Exception:
+            pass
         for paragraph_text in text.split("\n"):
             if paragraph_text.strip():
                 doc.add_paragraph(paragraph_text)
@@ -336,3 +354,10 @@ if __name__ == "__main__":
                 print(f"❌ Błąd transkrypcji {f}: {e}")
         else:
             print(f"⏩ Pomijam {f} (już przetworzony)")
+            # Usuń lokalny plik audio, jeśli już był przetworzony wcześniej
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+                    print(f"🗑️ Usunięto lokalny plik audio (już przetworzony): {f}")
+            except Exception as e2:
+                print(f"⚠️ Nie udało się usunąć pliku {f}: {e2}")
