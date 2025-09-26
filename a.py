@@ -4,7 +4,7 @@ import hashlib
 import sqlite3
 from elevenlabs.client import ElevenLabs
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,10 +13,12 @@ from dotenv import load_dotenv
 
 # ======= KONFIGURACJA =======
 load_dotenv()
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+SCOPES = ['https://www.googleapis.com/auth/drive']
 FOLDER_ID = os.getenv("FOLDER_ID")  # ID folderu Google Drive
 DOWNLOADS = os.getenv("DOWNLOADS_DIR")
 DB_PATH = os.getenv("DB_PATH")
+
+TRANSCRIPTS_SUBFOLDER_NAME = os.getenv("TRANSCRIPTS_SUBFOLDER_NAME", "transkrypty")
 # ============================
 
 # --- ElevenLabs client ---
@@ -149,7 +151,37 @@ def get_service():
         pass
     return build('drive', 'v3', credentials=creds)
 
-# --- Pobieranie mp3 z Google Drive ---
+# --- Helper: ensure transcripts subfolder exists under FOLDER_ID ---
+def ensure_transcripts_subfolder(service, parent_folder_id, subfolder_name):
+    q = (
+        f"'{parent_folder_id}' in parents and "
+        f"mimeType='application/vnd.google-apps.folder' and "
+        f"name='{subfolder_name}' and trashed=false"
+    )
+    result = service.files().list(
+        q=q,
+        fields="files(id, name)",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+        pageSize=10
+    ).execute()
+    items = result.get('files', [])
+    if items:
+        return items[0]['id']
+    metadata = {
+        'name': subfolder_name,
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_folder_id]
+    }
+    created = service.files().create(
+        body=metadata,
+        fields='id, name',
+        supportsAllDrives=True
+    ).execute()
+    print(f"✔ Utworzono podfolder: {created.get('name')} (id={created.get('id')})")
+    return created['id']
+
+# --- Pobieranie mp3/m4a/wav z Google Drive ---
 def download_new_mp3(folder_id, download_path=DOWNLOADS):
     service = get_service()
     os.makedirs(download_path, exist_ok=True)
@@ -246,6 +278,30 @@ def transcribe_with_elevenlabs(file_path):
                 doc.add_paragraph(paragraph_text)
         doc.save(docx_path)
         print(f"✔ Zapisano transkrypt: {docx_path}")
+        # Upload do podfolderu w folderze nagrań
+        try:
+            service = get_service()
+            transcripts_folder_id = ensure_transcripts_subfolder(service, FOLDER_ID, TRANSCRIPTS_SUBFOLDER_NAME)
+            metadata = {
+                'name': os.path.basename(docx_path),
+                'parents': [transcripts_folder_id]
+            }
+            media = MediaFileUpload(
+                docx_path,
+                mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                resumable=True
+            )
+            uploaded = service.files().create(
+                body=metadata,
+                media_body=media,
+                fields='id, name, webViewLink',
+                supportsAllDrives=True
+            ).execute()
+            print(f"✔ Przesłano transkrypt do '{TRANSCRIPTS_SUBFOLDER_NAME}': {uploaded.get('name')} (id={uploaded.get('id')})")
+            if uploaded.get('webViewLink'):
+                print(f"  Link: {uploaded.get('webViewLink')}")
+        except Exception as e:
+            print(f"❌ Błąd uploadu transkryptu do podfolderu: {e}")
     except ImportError:
         # Fallback do TXT jeśli python-docx nie jest zainstalowane
         txt_path = base + ".txt"
