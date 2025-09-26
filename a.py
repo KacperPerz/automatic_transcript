@@ -46,6 +46,89 @@ def is_new_file(path):
     conn.commit()
     return True
 
+# --- Utils: timestamps & diarization formatting ---
+def _get_value(obj, key, default=None):
+    # Single key helper for dicts or attributes
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+def _get_any(obj, keys, default=None):
+    for key in keys:
+        val = _get_value(obj, key, None)
+        if val is not None:
+            return val
+    return default
+
+def format_timestamp(total_seconds):
+    total_seconds = int(total_seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+def build_diarized_lines_from_words(words):
+    lines = []
+    current_minute_index = None
+    current_speaker = None
+    buffer_words = []
+
+    def flush_buffer():
+        if buffer_words:
+            text_chunk = " ".join(buffer_words).strip()
+            if text_chunk:
+                prefix = f"{current_speaker}: " if current_speaker else ""
+                lines.append(prefix + text_chunk)
+            buffer_words.clear()
+
+    for w in sorted(words, key=lambda w: _get_any(w, ["start"], 0)):
+        start = _get_any(w, ["start"], 0)
+        minute_index = int(start // 60)
+        speaker = _get_any(w, ["speaker", "speaker_label", "speaker_id"], None)
+        if speaker is None:
+            sp_idx = _get_any(w, ["speaker_id"], None)
+            if isinstance(sp_idx, int):
+                speaker = f"Speaker {sp_idx}"
+        if isinstance(speaker, int):
+            speaker = f"Speaker {speaker}"
+
+        if minute_index != current_minute_index:
+            flush_buffer()
+            lines.append(f"[{format_timestamp(minute_index * 60)}]")
+            current_minute_index = minute_index
+            current_speaker = None
+
+        if speaker != current_speaker:
+            flush_buffer()
+            current_speaker = speaker
+
+        word_text = _get_any(w, ["word", "text", "token"], "")
+        if word_text:
+            buffer_words.append(word_text)
+
+    flush_buffer()
+    return lines
+
+def build_diarized_lines_from_segments(segments):
+    lines = []
+    current_minute_index = None
+    for seg in sorted(segments, key=lambda s: _get_any(s, ["start"], 0)):
+        start = _get_any(seg, ["start"], 0)
+        minute_index = int(start // 60)
+        speaker = _get_any(seg, ["speaker", "speaker_label", "speaker_id"], None)
+        if isinstance(speaker, int):
+            speaker = f"Speaker {speaker}"
+        if minute_index != current_minute_index:
+            lines.append(f"[{format_timestamp(minute_index * 60)}]")
+            current_minute_index = minute_index
+        content = _get_any(seg, ["text", "content"], "")
+        if content:
+            prefix = f"{speaker}: " if speaker else ""
+            lines.append(prefix + content.strip())
+    return lines
+
 # --- Autoryzacja Google Drive ---
 def get_service():
     creds = None
@@ -112,7 +195,7 @@ def download_new_mp3(folder_id, download_path=DOWNLOADS):
 
 # --- Transkrypcja ElevenLabs ---
 def transcribe_with_elevenlabs(file_path):
-    print(f"🎤 Transkrybuję {file_path}...")
+    print(f"Transkrybuję {file_path}...")
     from io import BytesIO
     with open(file_path, "rb") as f:
         audio_data = BytesIO(f.read())
@@ -120,16 +203,55 @@ def transcribe_with_elevenlabs(file_path):
     transcription = eleven.speech_to_text.convert(
         file=audio_data,
         model_id="scribe_v1",
-        tag_audio_events=False,  # ustaw True jeśli chcesz [muzyka], [śmiech] itd.
+        tag_audio_events=True,  # ustaw True jeśli chcesz [muzyka], [śmiech] itd.
         diarize=True             # diarization = rozdzielanie mówców
     )
-    text = transcription["text"] if isinstance(transcription, dict) else transcription.text
+    # Build diarized text with timestamps every minute
+    if isinstance(transcription, dict):
+        words = transcription.get("words") or []
+        segments = transcription.get("segments") or []
+        if words:
+            lines = build_diarized_lines_from_words(words)
+            text = "\n".join(lines)
+        elif segments:
+            lines = build_diarized_lines_from_segments(segments)
+            text = "\n".join(lines)
+        else:
+            text = transcription.get("text") or ""
+    else:
+        # SDK object - try attributes
+        words = getattr(transcription, "words", None) or []
+        segments = getattr(transcription, "segments", None) or []
+        if words:
+            lines = build_diarized_lines_from_words(words)
+            text = "\n".join(lines)
+        elif segments:
+            lines = build_diarized_lines_from_segments(segments)
+            text = "\n".join(lines)
+        else:
+            text = getattr(transcription, "text", "")
 
+    # Zapis do pliku DOCX
     base, _ = os.path.splitext(file_path)
-    txt_path = base + ".txt"
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(text)
-    print(f"✔ Zapisano transkrypt: {txt_path}")
+    docx_path = base + ".docx"
+    try:
+        from docx import Document
+        from docx.shared import Pt
+        doc = Document()
+        style = doc.styles["Normal"]
+        style.font.name = "Calibri"
+        style.font.size = Pt(11)
+        for paragraph_text in text.split("\n"):
+            if paragraph_text.strip():
+                doc.add_paragraph(paragraph_text)
+        doc.save(docx_path)
+        print(f"✔ Zapisano transkrypt: {docx_path}")
+    except ImportError:
+        # Fallback do TXT jeśli python-docx nie jest zainstalowane
+        txt_path = base + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"✔ Zapisano transkrypt (TXT fallback): {txt_path}")
 
 # --- Main ---
 if __name__ == "__main__":
