@@ -8,17 +8,25 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.exceptions import RefreshError
 from dotenv import load_dotenv
 
 
 # ======= KONFIGURACJA =======
 load_dotenv()
-SCOPES = ['https://www.googleapis.com/auth/drive']
+SCOPES = [
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive.file',
+]
 FOLDER_ID = os.getenv("FOLDER_ID")  # ID folderu Google Drive
 DOWNLOADS = os.getenv("DOWNLOADS_DIR")
 DB_PATH = os.getenv("DB_PATH")
 
 TRANSCRIPTS_SUBFOLDER_NAME = os.getenv("TRANSCRIPTS_SUBFOLDER_NAME", "transkrypty")
+# Ścieżki plików autoryzacji obok tego pliku
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_PATH = os.path.join(BASE_DIR, 'token.json')
+CREDENTIALS_PATH = os.path.join(BASE_DIR, 'credentials.json')
 # ============================
 
 # --- ElevenLabs client ---
@@ -134,17 +142,19 @@ def build_diarized_lines_from_segments(segments):
 # --- Autoryzacja Google Drive ---
 def get_service():
     creds = None
-    token_path = os.path.abspath('token.json')
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                creds = None
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent', include_granted_scopes='true')
+            with open(TOKEN_PATH, 'w') as token:
+                token.write(creds.to_json())
     try:
         userinfo = build('oauth2', 'v2', credentials=creds).userinfo().get().execute()
     except Exception:
@@ -235,7 +245,7 @@ def transcribe_with_elevenlabs(file_path):
     transcription = eleven.speech_to_text.convert(
         file=audio_data,
         model_id="scribe_v1",
-        tag_audio_events=True,  # ustaw True jeśli chcesz [muzyka], [śmiech] itd.
+        tag_audio_events=False,  # ustaw True jeśli chcesz [muzyka], [śmiech] itd.
         diarize=True             # diarization = rozdzielanie mówców
     )
     # Build diarized text with timestamps every minute
@@ -300,6 +310,12 @@ def transcribe_with_elevenlabs(file_path):
             print(f"✔ Przesłano transkrypt do '{TRANSCRIPTS_SUBFOLDER_NAME}': {uploaded.get('name')} (id={uploaded.get('id')})")
             if uploaded.get('webViewLink'):
                 print(f"  Link: {uploaded.get('webViewLink')}")
+            # Po udanym uploadzie usuń lokalny plik audio
+            try:
+                os.remove(file_path)
+                print(f"🗑️ Usunięto lokalny plik audio: {file_path}")
+            except Exception as e2:
+                print(f"⚠️ Nie udało się usunąć pliku {file_path}: {e2}")
         except Exception as e:
             print(f"❌ Błąd uploadu transkryptu do podfolderu: {e}")
     except ImportError:
