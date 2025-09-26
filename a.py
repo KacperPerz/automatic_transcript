@@ -11,19 +11,16 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from dotenv import load_dotenv
 
 
-
 # ======= KONFIGURACJA =======
 load_dotenv()
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 FOLDER_ID = os.getenv("FOLDER_ID")  # ID folderu Google Drive
 DOWNLOADS = os.getenv("DOWNLOADS_DIR")
 DB_PATH = os.getenv("DB_PATH")
-print(FOLDER_ID, DOWNLOADS, DB_PATH)
-
 # ============================
 
 # --- ElevenLabs client ---
-eleven = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+eleven = ElevenLabs(api_key=os.getenv("ELEVEN_LABS_API_KEY"))
 
 # --- SQLite ---
 conn = sqlite3.connect(DB_PATH)
@@ -63,10 +60,8 @@ def get_service():
             creds = flow.run_local_server(port=0)
         with open('token.json', 'w') as token:
             token.write(creds.to_json())
-    print(f"Using token: {token_path}")
     try:
         userinfo = build('oauth2', 'v2', credentials=creds).userinfo().get().execute()
-        print(f"Drive account: {userinfo.get('email')}")
     except Exception:
         pass
     return build('drive', 'v3', credentials=creds)
@@ -139,7 +134,6 @@ def transcribe_with_elevenlabs(file_path):
 # --- Main ---
 if __name__ == "__main__":
     files = download_new_mp3(FOLDER_ID)
-    exit()
     for f in files:
         if is_new_file(f):
             try:
