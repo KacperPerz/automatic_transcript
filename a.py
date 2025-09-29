@@ -3,6 +3,7 @@ import io
 import hashlib
 import sqlite3
 import re
+import logging
 from elevenlabs.client import ElevenLabs
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
@@ -28,6 +29,10 @@ TRANSCRIPTS_SUBFOLDER_NAME = os.getenv("TRANSCRIPTS_SUBFOLDER_NAME", "transkrypt
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, 'token.json')
 CREDENTIALS_PATH = os.path.join(BASE_DIR, 'credentials.json')
+
+# --- Logging ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 # ============================
 
 # --- ElevenLabs client ---
@@ -162,8 +167,9 @@ def get_service():
                 token.write(creds.to_json())
     try:
         userinfo = build('oauth2', 'v2', credentials=creds).userinfo().get().execute()
+        logging.info(f"Użytkownik Google Drive: {userinfo.get('email')}")
     except Exception:
-        pass
+        logging.warning("Nie udało się pobrać informacji o użytkowniku Drive")
     return build('drive', 'v3', credentials=creds)
 
 # --- Helper: ensure transcripts subfolder exists under FOLDER_ID ---
@@ -205,16 +211,16 @@ def download_new_mp3(folder_id, download_path=DOWNLOADS):
         folder_meta = service.files().get(
             fileId=folder_id,
             fields="id, name, mimeType, parents").execute()
-        print(f"Folder meta: {folder_meta}")
+        logging.info(f"Pobrano metadane folderu: {folder_meta}")
     except Exception as e:
-        print(f"Cannot read folder meta ({folder_id}): {e}")
+        logging.error(f"Nie można odczytać metadanych folderu ({folder_id}): {e}")
 
     # List all direct children first, then filter locally to catch odd MIME types
     results = service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(id, name, mimeType)").execute()
     items = results.get('files', [])
-    print(f"Children: {[{'name': i['name'], 'mimeType': i.get('mimeType')} for i in items]}")
+    logging.info(f"Zawartość folderu: {[{'name': i['name'], 'mimeType': i.get('mimeType')} for i in items]}")
 
     new_files = []
     for file in items:
@@ -225,7 +231,7 @@ def download_new_mp3(folder_id, download_path=DOWNLOADS):
             continue
         file_path = os.path.join(download_path, file['name'])
         if not os.path.exists(file_path):
-            print(f"⬇️ Pobieram {file['name']}...")
+            logging.info(f"Pobieranie pliku: {file['name']}")
             request = service.files().get_media(fileId=file['id'])
             with io.FileIO(file_path, 'wb') as fh:
                 downloader = MediaIoBaseDownload(fh, request)
@@ -233,8 +239,8 @@ def download_new_mp3(folder_id, download_path=DOWNLOADS):
                 while not done:
                     status, done = downloader.next_chunk()
                     if status:
-                        print(f"   Pobrano {int(status.progress() * 100)}%")
-            print(f"✔ Zapisano: {file_path}")
+                        logging.info(f"Postęp pobierania {file['name']}: {int(status.progress() * 100)}%")
+            logging.info(f"Zapisano plik: {file_path}")
             new_files.append(file_path)
         else:
             new_files.append(file_path)  # istnieje, ale sprawdzimy hash
@@ -242,7 +248,7 @@ def download_new_mp3(folder_id, download_path=DOWNLOADS):
 
 # --- Transkrypcja ElevenLabs ---
 def transcribe_with_elevenlabs(file_path):
-    print(f"Transkrybuję {file_path}...")
+    logging.info(f"Start transkrypcji: {file_path}")
     from io import BytesIO
     with open(file_path, "rb") as f:
         audio_data = BytesIO(f.read())
@@ -305,7 +311,7 @@ def transcribe_with_elevenlabs(file_path):
             if paragraph_text.strip():
                 doc.add_paragraph(paragraph_text)
         doc.save(docx_path)
-        print(f"✔ Zapisano transkrypt: {docx_path}")
+        logging.info(f"Zapisano transkrypt DOCX: {docx_path}")
         # Upload do podfolderu w folderze nagrań
         try:
             service = get_service()
@@ -325,39 +331,41 @@ def transcribe_with_elevenlabs(file_path):
                 fields='id, name, webViewLink',
                 supportsAllDrives=True
             ).execute()
-            print(f"✔ Przesłano transkrypt do '{TRANSCRIPTS_SUBFOLDER_NAME}': {uploaded.get('name')} (id={uploaded.get('id')})")
+            logging.info(f"Przesłano transkrypt do '{TRANSCRIPTS_SUBFOLDER_NAME}': {uploaded.get('name')} (id={uploaded.get('id')})")
             if uploaded.get('webViewLink'):
-                print(f"  Link: {uploaded.get('webViewLink')}")
+                logging.info(f"Link do transkryptu: {uploaded.get('webViewLink')}")
             # Po udanym uploadzie usuń lokalny plik audio
             try:
                 os.remove(file_path)
-                print(f"🗑️ Usunięto lokalny plik audio: {file_path}")
+                logging.info(f"Usunięto lokalny plik audio: {file_path}")
             except Exception as e2:
-                print(f"⚠️ Nie udało się usunąć pliku {file_path}: {e2}")
+                logging.warning(f"Nie udało się usunąć pliku {file_path}: {e2}")
         except Exception as e:
-            print(f"❌ Błąd uploadu transkryptu do podfolderu: {e}")
+            logging.error(f"Błąd uploadu transkryptu do podfolderu: {e}")
     except ImportError:
         # Fallback do TXT jeśli python-docx nie jest zainstalowane
         txt_path = base + ".txt"
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write(text)
-        print(f"✔ Zapisano transkrypt (TXT fallback): {txt_path}")
+        logging.info(f"Zapisano transkrypt w TXT (fallback): {txt_path}")
 
 # --- Main ---
 if __name__ == "__main__":
+    logging.info("Rozpoczęcie sesji: pobieranie nowych plików")
     files = download_new_mp3(FOLDER_ID)
     for f in files:
         if is_new_file(f):
             try:
                 transcribe_with_elevenlabs(f)
             except Exception as e:
-                print(f"❌ Błąd transkrypcji {f}: {e}")
+                logging.error(f"Błąd transkrypcji {f}: {e}")
         else:
-            print(f"⏩ Pomijam {f} (już przetworzony)")
+            logging.info(f"Pomijam (już przetworzony): {f}")
             # Usuń lokalny plik audio, jeśli już był przetworzony wcześniej
             try:
                 if os.path.exists(f):
                     os.remove(f)
-                    print(f"🗑️ Usunięto lokalny plik audio (już przetworzony): {f}")
+                    logging.info(f"Usunięto lokalny plik audio (już przetworzony): {f}")
             except Exception as e2:
-                print(f"⚠️ Nie udało się usunąć pliku {f}: {e2}")
+                logging.warning(f"Nie udało się usunąć pliku {f}: {e2}")
+    logging.info("Zakończenie sesji: przetwarzanie ukończone")
